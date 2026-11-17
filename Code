@@ -1,0 +1,383 @@
+import argparse
+import csv
+import random
+import re
+import sys
+import unittest
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+# Example line: 2026-11-10 03:12:44 LOGIN_FAILED user=admin ip=203.0.113.45
+LINE_PATTERN = re.compile(
+    r"^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
+    r"(?P<event>LOGIN_FAILED|LOGIN_SUCCESS) "
+    r"user=(?P<user>\S+) ip=(?P<ip>\S+)$"
+)
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+DEFAULT_THRESHOLD = 5      # failed attempts that count as a brute force burst
+DEFAULT_WINDOW_MINUTES = 10
+WORK_START_HOUR = 6        # successful logins before this hour are "off-hours"
+WORK_END_HOUR = 22         # ...and so are logins at or after this hour
+
+SAMPLE_LOG_PATH = "sample_logs/auth_sample.log"
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LogEntry:
+    time: datetime
+    event: str
+    user: str
+    ip: str
+
+
+@dataclass
+class Finding:
+    severity: str
+    category: str
+    ip: str
+    user: str
+    time: str
+    detail: str
+
+
+# ---------------------------------------------------------------------------
+# Reading the log
+# ---------------------------------------------------------------------------
+
+def parse_log(path):
+    """Read a log file. Returns (entries, number_of_unreadable_lines)."""
+    entries = []
+    skipped = 0
+    with open(path, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            match = LINE_PATTERN.match(line)
+            if not match:
+                skipped += 1
+                continue
+            entries.append(
+                LogEntry(
+                    time=datetime.strptime(match["time"], TIME_FORMAT),
+                    event=match["event"],
+                    user=match["user"],
+                    ip=match["ip"],
+                )
+            )
+    entries.sort(key=lambda entry: entry.time)
+    return entries, skipped
+
+
+# ---------------------------------------------------------------------------
+# Detection checks
+# ---------------------------------------------------------------------------
+
+def find_brute_force(entries, threshold, window_minutes):
+    """Flag IPs with `threshold` or more failures inside the time window.
+
+    Returns a list of findings plus a dict mapping each flagged IP to the
+    time the burst was first detected (used to check for later successes).
+    """
+    window = timedelta(minutes=window_minutes)
+    failures_by_ip = defaultdict(list)
+    for entry in entries:
+        if entry.event == "LOGIN_FAILED":
+            failures_by_ip[entry.ip].append(entry)
+
+    findings = []
+    flagged = {}
+    for ip, failures in failures_by_ip.items():
+        start = 0
+        peak = 0
+        peak_users = set()
+        first_trigger = None
+        for end in range(len(failures)):
+            # Slide the window forward so it only covers `window_minutes`.
+            while failures[end].time - failures[start].time > window:
+                start += 1
+            count = end - start + 1
+            if count >= threshold and first_trigger is None:
+                first_trigger = failures[end].time
+            if count > peak:
+                peak = count
+                peak_users = {f.user for f in failures[start : end + 1]}
+        if peak >= threshold:
+            users = sorted(peak_users)
+            findings.append(
+                Finding(
+                    severity="HIGH",
+                    category="Brute force",
+                    ip=ip,
+                    user=", ".join(users),
+                    time=first_trigger.strftime(TIME_FORMAT),
+                    detail=(
+                        f"Up to {peak} failed logins within {window_minutes} "
+                        f"minutes, targeting {len(users)} account(s)"
+                    ),
+                )
+            )
+            flagged[ip] = first_trigger
+    return findings, flagged
+
+
+def find_possible_compromise(entries, flagged):
+    """Flag successful logins from an IP after it was flagged for brute force."""
+    findings = []
+    seen = set()
+    for entry in entries:
+        if entry.event != "LOGIN_SUCCESS" or entry.ip not in flagged:
+            continue
+        if entry.time >= flagged[entry.ip] and entry.ip not in seen:
+            seen.add(entry.ip)
+            findings.append(
+                Finding(
+                    severity="CRITICAL",
+                    category="Possible compromise",
+                    ip=entry.ip,
+                    user=entry.user,
+                    time=entry.time.strftime(TIME_FORMAT),
+                    detail="Successful login after a brute force burst. Reset the password and review the account.",
+                )
+            )
+    return findings
+
+
+def find_off_hours_logins(entries):
+    """Flag successful logins outside normal working hours."""
+    findings = []
+    for entry in entries:
+        if entry.event != "LOGIN_SUCCESS":
+            continue
+        if entry.time.hour < WORK_START_HOUR or entry.time.hour >= WORK_END_HOUR:
+            findings.append(
+                Finding(
+                    severity="MEDIUM",
+                    category="Off-hours login",
+                    ip=entry.ip,
+                    user=entry.user,
+                    time=entry.time.strftime(TIME_FORMAT),
+                    detail=f"Successful login outside {WORK_START_HOUR:02d}:00 to {WORK_END_HOUR:02d}:00",
+                )
+            )
+    return findings
+
+
+def analyse(entries, threshold=DEFAULT_THRESHOLD, window_minutes=DEFAULT_WINDOW_MINUTES):
+    """Run every check and return findings sorted by severity."""
+    brute, flagged = find_brute_force(entries, threshold, window_minutes)
+    compromise = find_possible_compromise(entries, flagged)
+    off_hours = find_off_hours_logins(entries)
+    # Avoid reporting the same login twice (as compromise and as off-hours).
+    already_reported = {(f.ip, f.time) for f in compromise}
+    off_hours = [f for f in off_hours if (f.ip, f.time) not in already_reported]
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
+    return sorted(compromise + brute + off_hours, key=lambda f: (order[f.severity], f.time))
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def write_csv(findings, path):
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["severity", "category", "ip", "user", "time", "detail"])
+        for f in findings:
+            writer.writerow([f.severity, f.category, f.ip, f.user, f.time, f.detail])
+
+
+def print_summary(entries, skipped, findings):
+    failed = [e for e in entries if e.event == "LOGIN_FAILED"]
+    success = [e for e in entries if e.event == "LOGIN_SUCCESS"]
+
+    print("=" * 60)
+    print("LOG ANALYSIS SUMMARY")
+    print("=" * 60)
+    print(f"Lines analysed:      {len(entries)}")
+    if skipped:
+        print(f"Unreadable lines:    {skipped} (skipped)")
+    print(f"Failed logins:       {len(failed)}")
+    print(f"Successful logins:   {len(success)}")
+    if entries:
+        print(f"Period covered:      {entries[0].time:%Y-%m-%d %H:%M} to {entries[-1].time:%Y-%m-%d %H:%M}")
+
+    print("\nTop 5 IPs by failed logins")
+    for ip, count in Counter(e.ip for e in failed).most_common(5):
+        print(f"  {ip:<18} {count}")
+
+    print("\nTop 5 targeted accounts")
+    for user, count in Counter(e.user for e in failed).most_common(5):
+        print(f"  {user:<18} {count}")
+
+    print(f"\nFINDINGS ({len(findings)})")
+    if not findings:
+        print("  Nothing suspicious found.")
+    for f in findings:
+        print(f"  [{f.severity}] {f.category}: {f.ip} (user: {f.user}) at {f.time}")
+        print(f"      {f.detail}")
+
+
+# ---------------------------------------------------------------------------
+# Sample log generator (made-up data, reserved documentation IP addresses)
+# ---------------------------------------------------------------------------
+
+def generate_sample_log(path=SAMPLE_LOG_PATH):
+    """Create a made-up authentication log so the analyser can be tried safely."""
+    rng = random.Random(42)  # same output every run
+    users = ["amy", "ben", "chloe", "dev", "ella", "farid"]
+    office_ips = ["198.51.100.10", "198.51.100.11", "198.51.100.12"]
+    attacker_ip = "203.0.113.45"
+    probing_ip = "203.0.113.99"
+    day = datetime(2026, 11, 10)
+
+    rows = []
+
+    def add(when, event, user, ip):
+        rows.append((when, f"{when:%Y-%m-%d %H:%M:%S} {event} user={user} ip={ip}"))
+
+    # Normal working-day activity: mostly successes, the odd typo.
+    for _ in range(120):
+        when = day + timedelta(hours=rng.randint(8, 18), minutes=rng.randint(0, 59), seconds=rng.randint(0, 59))
+        event = "LOGIN_FAILED" if rng.random() < 0.06 else "LOGIN_SUCCESS"
+        add(when, event, rng.choice(users), rng.choice(office_ips))
+
+    # Brute force: one IP hammers the admin account, then gets in.
+    attack = day + timedelta(hours=3, minutes=12)
+    for i in range(14):
+        add(attack + timedelta(seconds=20 * i), "LOGIN_FAILED", rng.choice(["admin", "root", "admin"]), attacker_ip)
+    add(attack + timedelta(minutes=6), "LOGIN_SUCCESS", "admin", attacker_ip)
+
+    # Low and slow probing: a few failures, not enough to trip the threshold.
+    probe = day + timedelta(hours=14, minutes=5)
+    for i in range(3):
+        add(probe + timedelta(minutes=25 * i), "LOGIN_FAILED", "ben", probing_ip)
+
+    # A genuine but unusual late-night login.
+    add(day + timedelta(hours=23, minutes=41), "LOGIN_SUCCESS", "dev", office_ips[0])
+
+    rows.sort(key=lambda pair: pair[0])
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(text for _, text in rows) + "\n", encoding="utf-8")
+    return out, len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Tests (run with: python log_analyser.py --test)
+# ---------------------------------------------------------------------------
+
+def _entry(time, event, user="admin", ip="203.0.113.1"):
+    return LogEntry(datetime.strptime(time, TIME_FORMAT), event, user, ip)
+
+
+class BruteForceTests(unittest.TestCase):
+    def test_flags_burst_of_failures(self):
+        entries = [_entry(f"2026-11-10 10:00:{s:02d}", "LOGIN_FAILED") for s in range(0, 50, 10)]
+        findings, flagged = find_brute_force(entries, threshold=5, window_minutes=10)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("203.0.113.1", flagged)
+
+    def test_ignores_slow_failures(self):
+        entries = [_entry(f"2026-11-10 {h:02d}:00:00", "LOGIN_FAILED") for h in range(8, 13)]
+        findings, _ = find_brute_force(entries, threshold=5, window_minutes=10)
+        self.assertEqual(findings, [])
+
+    def test_reports_peak_count(self):
+        entries = [_entry(f"2026-11-10 10:00:{s:02d}", "LOGIN_FAILED") for s in range(0, 40, 2)]
+        findings, _ = find_brute_force(entries, threshold=5, window_minutes=10)
+        self.assertIn("Up to 20", findings[0].detail)
+
+
+class OffHoursTests(unittest.TestCase):
+    def test_flags_night_login_only(self):
+        entries = [
+            _entry("2026-11-10 03:00:00", "LOGIN_SUCCESS"),
+            _entry("2026-11-10 12:00:00", "LOGIN_SUCCESS"),
+        ]
+        findings = find_off_hours_logins(entries)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].time, "2026-11-10 03:00:00")
+
+
+class CompromiseTests(unittest.TestCase):
+    def test_success_after_burst_is_critical(self):
+        entries = [_entry(f"2026-11-10 12:00:{s:02d}", "LOGIN_FAILED") for s in range(0, 50, 10)]
+        entries.append(_entry("2026-11-10 12:05:00", "LOGIN_SUCCESS"))
+        findings = analyse(entries)
+        self.assertEqual(findings[0].severity, "CRITICAL")
+
+    def test_normal_login_is_not_flagged(self):
+        findings = analyse([_entry("2026-11-10 12:05:00", "LOGIN_SUCCESS")])
+        self.assertEqual(findings, [])
+
+
+def run_tests():
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Find suspicious sign-in activity in a log file.")
+    parser.add_argument("logfile", nargs="?", help="path to the log file")
+    parser.add_argument("--demo", action="store_true",
+                        help="create a made-up sample log and analyse it")
+    parser.add_argument("--test", action="store_true", help="run the unit tests")
+    parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD,
+                        help=f"failed logins that count as brute force (default {DEFAULT_THRESHOLD})")
+    parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_MINUTES,
+                        help=f"time window in minutes (default {DEFAULT_WINDOW_MINUTES})")
+    parser.add_argument("--output", default="reports/findings.csv",
+                        help="where to save the CSV report (default reports/findings.csv)")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return run_tests()
+
+    if args.demo:
+        path, count = generate_sample_log()
+        print(f"Created {count} sample log lines in {path}\n")
+    elif args.logfile:
+        path = Path(args.logfile)
+    else:
+        parser.print_help()
+        return 1
+
+    if not Path(path).exists():
+        print(f"Error: cannot find {path}", file=sys.stderr)
+        return 1
+
+    entries, skipped = parse_log(path)
+    findings = analyse(entries, args.threshold, args.window)
+    print_summary(entries, skipped, findings)
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_csv(findings, output)
+    print(f"\nReport saved to {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
